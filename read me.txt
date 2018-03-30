@@ -1,0 +1,6 @@
+1. Please download the data from the below URL
+https://www.kaggle.com/kemical/kickstarter-projects
+
+2. Run the script in R studio
+
+3. Save the other requried files like NYSE files.

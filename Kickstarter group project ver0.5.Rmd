@@ -1,0 +1,933 @@
+---
+title: "Kickstarter group project ver0.2"
+author: "Meemoh Shrivastava"
+date: "March 25, 2018"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Load the required libraries
+
+```{r}
+library(ggplot2)
+library(dplyr)
+library(readr)
+library(lubridate)
+library(corrplot)
+library(stringr)
+library(jsonlite)
+library(tidytext)
+library(rpart)
+library(rpart.plot)
+library(C50)
+library(randomForest)
+library(caret)
+library(e1071)
+library(pscl)
+library(ROCR)
+
+```
+
+## pre load additional data 
+```{r}
+
+data.df = read.csv("dataset/ks-projects-201801.csv")
+nyse.df = read.csv("dataset/NYSE_prices.csv")
+
+
+temp.df = data.df 
+
+temp.df$deadline =as.character(temp.df$deadline)
+
+# drop the columns which we don't need
+nyse.df = nyse.df[ , which(names(nyse.df) %in% c("Date","Adj.Close"))]
+
+#change the column name for the nyse data
+colnames(nyse.df) = c("deadline","NYSE_price")
+
+nyse.df$deadline = strftime(strptime(nyse.df$deadline,"%m/%d/%Y"),"%Y-%m-%d")
+
+data.df <- temp.df %>%
+  inner_join(nyse.df, by = "deadline")
+
+
+```
+
+
+## Load the data and setup the data in the required format 
+
+```{r}
+
+
+# copy data in another data frame which will be used 
+kick.df = data.df
+
+View(data.df)
+
+# create additional columns
+kick.df$name_length = nchar(as.character(kick.df$name), type = "chars", allowNA = FALSE, keepNA = NA)
+kick.df$comp_ratio = kick.df$usd_pledged_real/ kick.df$usd_goal_real
+
+#Converting date time-stamps to date and time format
+kick.df$launched <- strptime(kick.df$launched, "%Y-%m-%d %H:%M:%S")
+kick.df$deadline <- strptime(kick.df$deadline, "%Y-%m-%d")
+kick.df$time2success <- as.numeric(difftime(kick.df$deadline, kick.df$launched, units="days"))
+
+# create additional variables for year and month
+kick.df$launched_year = factor(year(kick.df$launched))
+kick.df$launched_month = factor(month(kick.df$launched))
+
+kick.df$deadline_year = factor(year(kick.df$deadline))
+kick.df$deadline_month = factor(month(kick.df$deadline))
+
+# str(kick.df)
+nrow(kick.df)
+
+#Filtering out records where the name is not present
+kick.df = subset(kick.df,kick.df$name_length>0)
+nrow(kick.df)
+
+#Filtering out records where the goal is less than 500 dollars
+kick.df = subset(kick.df,kick.df$usd_goal_real>500)
+nrow(kick.df)
+
+#Filtering out records where the amound pledged is 25 - at least 5% of the minimum value
+kick.df = subset(kick.df,kick.df$usd_pledged_real>25)
+nrow(kick.df)
+
+#Filtering out records where the status for the kickstarter is undefined value
+kick.df = subset(kick.df,kick.df$state!="undefined")
+nrow(kick.df)
+
+# impute the data where the status was cancelled to failed
+# it is a big big assumption , and we can look at data latter to understand more 
+# about the cancelled kick starters later
+kick.df$state[kick.df$state=="canceled"] = "failed"
+kick.df$state[kick.df$state=="suspended"] = "failed"
+
+# also assuming that the status will be changed to sucess if the current status is live
+kick.df$state[kick.df$state=="live"] = "successful"
+
+# make the factor variable setting of state to only 2 
+kick.df$state = as.factor(as.character(kick.df$state))
+
+#filter the outliers where the comp ratio is more than 100 times the initial projection
+kick.df = subset(kick.df,kick.df$comp_ratio<100)
+
+# take a copy of the data to be used for sentiment analysis
+sen.data.df = kick.df
+meansx.data.df =kick.df
+means.data2.df = kick.df
+
+# now trim the unwanted variables , we are getting rid of category also
+# as there is too much of diversification due to category
+kick.df = kick.df[ , -which(names(kick.df) %in% c("ID","name","category","deadline","launched","pledged","country","usd.pledged"))]
+
+#finally look at the data file
+View(kick.df)
+
+#set a specfic see
+set.seed(12345678)
+
+#get training and testing data we are dividing the data into 60:40 ratio
+ind = sample(1:nrow(kick.df),floor(nrow(kick.df)*0.40))
+kick.train.df = kick.df[ind,]
+kick.test.df =kick.df[-ind,]
+
+
+# now remove the additional values for sentiment analysis test
+sen.data.df = sen.data.df[ , -which(names(sen.data.df) %in% c("category","deadline","launched","pledged","country","usd.pledged"))]
+
+# convert the state into binary variable
+meansx.data.df$result[meansx.data.df$state=="successful"] = 1
+meansx.data.df$result[meansx.data.df$state=="failed"] = 0
+
+# decide on the additional values for 
+meansx.data.df = meansx.data.df[ , which(names(meansx.data.df) %in% c("usd_pledged_real","usd_goal_real","time2success","backers","result","comp_ratio","deadline_year","deadline_month","NYSE_price","ID"))]
+
+means.data2.df = meansx.data.df
+```
+
+# first attempt a multi linear regression with comp_ratio as a depedent continuous variable
+```{r}
+
+# create a variable which stores the data for regression
+reg.data = kick.train.df
+
+str(reg.data)
+
+# get a subset of reg data of continious variables
+reg.cont.data = reg.data[ , which(names(reg.data) %in% c("backers","usd_pledged_real","usd_goal_real","name_length","comp_ratio","time2success","NYSE_price"))]
+
+#plot a coorelation graph
+str(reg.data)
+regcor = cor(reg.cont.data)
+print(regcor)
+corrplot(regcor,method = "number")
+
+#plot matrix of all variables
+plot(reg.cont.data,pch=16,col="light blue")
+
+# as there is too much of diversification due to category
+reg.data = reg.data[ , -which(names(reg.data) %in% c("state"))]
+
+
+# step wise regression
+base.mod = lm(comp_ratio ~ 1,data=reg.data)
+all.mod = lm(comp_ratio ~ . ,data = reg.data)
+stepMod = step(base.mod,scope = list(lower=base.mod,upper=all.mod),direction = "both",trace=0,steps = 1000) #perform step-wise algorithm
+summary(stepMod)
+
+
+# run the prediction
+prediction = predict(stepMod,kick.test.df)
+
+# find correlational accuracy
+actuals_preds <- data.frame(cbind(actuals=kick.test.df$comp_ratio, predicteds=prediction))  # make actuals_predicteds dataframe.
+correlation_accuracy <- cor(actuals_preds)  # 42.61%
+print(correlation_accuracy)
+```
+
+## text analytics to do sentiment analysis and then do a multi regression
+## with sentiment as one of the varibles.
+```{r}
+# create a variable which stores the data for sentiment
+sen.data = sen.data.df
+
+sen.data$name =as.character(sen.data$name)
+str(sen.data$name)
+
+#We do some data manipulation work like removing stopwords, punctuation marks, etc.
+review_words <- sen.data %>%
+  select(ID, comp_ratio, name) %>%
+  unnest_tokens(word, name) %>%
+  filter(!word %in% stop_words$word,
+         str_detect(word, "^[a-z']+$"))
+
+#View reviews_words; to see one word per document and how the data array looks like
+View(review_words)
+
+#apply AFINN
+AFINN <- sentiments %>%
+  filter(lexicon == "AFINN") %>%
+  select(word, afinn_score = score)
+
+#see the AFINN scores being assigned to see if they make sense
+View(AFINN)
+
+#The commands below now combine the scores and assigns it to each reviewer so that
+#we can analyze by reviewer (we also have the star/5-point scale side by side)
+reviews_sentiment <- review_words %>%
+  inner_join(AFINN, by = "word") %>%
+  group_by(ID, comp_ratio) %>%
+  summarize(sentiment = mean(afinn_score))
+
+#Let's view to make sure each line has reviewer-sent.score-star rat. all lined up
+View(reviews_sentiment)
+
+sen.data2 = sen.data%>%
+  inner_join(reviews_sentiment[,-2], by = "ID")
+
+#set a specfic see
+set.seed(12345678)
+
+#get training and testing data we are dividing the data into 60:40 ratio
+ind = sample(1:nrow(sen.data2),floor(nrow(sen.data2)*0.40))
+sen.train.df = sen.data2[ind,]
+sen.test.df =sen.data2[-ind,]
+
+
+# now use it to do multi step regression 
+# step wise regression
+base.mod = lm(comp_ratio ~ main_category,data=sen.train.df[,c(-1,-2)])
+all.mod = lm(comp_ratio ~ . ,data = sen.train.df[,c(-1,-2)])
+stepMod = step(base.mod,scope = list(lower=base.mod,upper=all.mod),direction = "both",trace=0,steps = 1000) #perform step-wise algorithm
+summary(stepMod)
+
+# run the prediction
+prediction = predict(stepMod,sen.test.df[,c(-1,-2)])
+
+# find correlational accuracy
+actuals_preds <- data.frame(cbind(actuals=sen.test.df$comp_ratio, predicteds=prediction))  # make actuals_predicteds dataframe.
+correlation_accuracy <- cor(actuals_preds)  # 51.38%
+print(correlation_accuracy)
+
+
+```
+
+## do a logit and tree based classification
+```{r}
+
+tree.df = kick.train.df
+tree.test.df = kick.test.df
+
+#tree.df = sen.train.df
+#tree.test.df = sen.test.df
+
+
+#run a logistic regression on the cleaned training data
+logit.regr.clean <- glm(state~ ., data = tree.df, family = "binomial")
+summary(logit.regr.clean)
+
+# predict the data
+#logit.test.pred <- predict(logit.regr.clean,tree.test.df , type = "response")
+#summary(logit.test.pred)
+
+#prediction table
+#logit.predict <- logit.test.pred
+#logit.predict[logit.predict<0.5] <- 0
+#logit.predict[logit.predict>=0.5] <- 1
+#table(logit.predict, kick.test.df$state, dnn=c("Predicted", "Actual"))
+
+#run a logistic regression on the updated training data
+logit.regr.clean <- glm(state~ main_category + backers + usd_pledged_real + name_length + time2success, 
+                  data = tree.df, family = "binomial")
+summary(logit.regr.clean)
+
+# predict the data
+logit.test.pred <- predict(logit.regr.clean,tree.test.df , type = "response")
+summary(logit.test.pred)
+
+#prediction table
+logit.predict <- logit.test.pred
+logit.predict[logit.predict<0.5] <- 0
+logit.predict[logit.predict>=0.5] <- 1
+length(logit.predict)
+length(kick.test.df$state)
+print("Prediction table for simmple logistic regression")
+table(logit.predict, tree.test.df$state, dnn=c("Predicted", "Actual"))
+
+
+# simple CART decsion tree
+simple_tree = rpart(state ~ main_category + backers + usd_pledged_real + name_length + time2success, data = tree.df, method ="class")
+rpart.plot(simple_tree)
+
+# now prun the tree to improve the performance
+print("Current cp for CART")
+printcp(simple_tree)
+simple.prune <- prune(simple_tree,cp=simple_tree$cptable[which.min(simple_tree$cptable[,"xerror"]),"CP"])
+rpart.plot(simple.prune)
+
+prune.predict <- predict(simple.prune, newdata = tree.test.df)
+prune.predict = as.data.frame(prune.predict)
+prune.predict$state[prune.predict$successful<0.5] <- "failed"
+prune.predict$state[prune.predict$successful>=0.5] <- "successful"
+
+print("Prediction table for pruned tree")
+ table(prune.predict$state, tree.test.df$state, dnn=c("Predicted", "Actual"))
+ 
+
+#bagging
+bag.cs=randomForest(state ~  main_category + backers + usd_pledged_real + name_length + time2success, data = tree.df, mtry=12,
+                    na.action=na.omit, importance=TRUE)
+bag.cs
+
+print("Prediction table for bagging")
+yhat.bag = predict(bag.cs,newdata=tree.test.df)
+confusionMatrix(yhat.bag, tree.test.df$state) 
+
+plot(yhat.bag, tree.test.df$state)
+abline(0,1)
+
+#plot MeanDecreaseGini
+varImpPlot(bag.cs,type=2)
+
+#random forest - fix random forest issue
+rforest.tree <- randomForest(state ~ main_category + backers + usd_pledged_real + name_length + time2success, data = tree.df,ntreeTry=100, mtry=4, na.action=na.omit)
+
+rforest.predict <- predict(rforest.tree, newdata = tree.test.df)
+ table(rforest.predict, tree.test.df$state, dnn=c("Predicted", "Actual"))
+
+#boosted trees
+boosted.tree <- C5.0(state ~ main_category + backers + usd_pledged_real + name_length + time2success, data = tree.df, trial = 20)
+# plot(boosted.tree, trial = 9)
+
+print("Prediction table for boosting")
+boost.predict <- predict(boosted.tree, newdata = tree.test.df)
+table(boost.predict, tree.test.df$state, dnn=c("Predicted", "Actual"))
+
+#ROC function for data preparation
+roc.curve <- function(model, data) {
+  prob <- data.frame(predict(model, newdata = data, type = "prob"))
+  colnames(prob) <- c("Tr","Fa")
+  prep.roc <- prediction(prob$Fa, data$state)
+  roc.data <- performance(prep.roc, "tpr", "fpr")
+  return(roc.data)
+}
+
+#AUC function for data preparation
+roc.curve.auc <- function(model, data) {
+  prob <- data.frame(predict(model, newdata = data, type = "prob"))
+  colnames(prob) <- c("Tr","Fa")
+  prep.roc <- prediction(prob$Fa, data$state)
+  roc.auc <- performance(prep.roc, measure = "auc")
+  return(roc.auc)
+}
+
+#logit ROC and AUC - check for the prediction
+pred.glm <- prediction(logit.test.pred, tree.test.df$state)
+perf.glm <- performance(pred.glm, "tpr", "fpr")
+glm.auc <- round(as.numeric(performance(prediction(logit.test.pred, tree.test.df$state),measure = "auc")@y.values), 2)
+
+#decision tree ROC and AUC
+simple.roc <- roc.curve(simple_tree, tree.test.df)
+simple.auc <- round(as.numeric(roc.curve.auc(simple_tree, tree.test.df)@y.values), 2) 
+
+#random forest ROC and AUC
+rf.roc <- roc.curve(rforest.tree, tree.test.df)
+rf.auc <- round(as.numeric(roc.curve.auc(rforest.tree, tree.test.df)@y.values), 2)  
+
+#bagging ROC and AUC
+bag.roc <- roc.curve(bag.cs, tree.test.df)
+bag.auc <- round(as.numeric(roc.curve.auc(bag.cs, tree.test.df)@y.values), 2)  
+
+#boosting ROC and AUC
+boost.roc <- roc.curve(boosted.tree, tree.test.df)
+boost.auc <- round(as.numeric(roc.curve.auc(boosted.tree, tree.test.df)@y.values), 2)  
+
+#plot the ROC curves and show AUC
+plot(perf.glm, xlim=c(0,1),ylim=c(0,1))
+plot(simple.roc,xlim=c(0,1),ylim=c(0,1), lty=2, add=TRUE)
+plot(boost.roc,xlim=c(0,1),ylim=c(0,1), lty=3, add=TRUE)
+plot(rf.roc,xlim=c(0,1),ylim=c(0,1), lty=4, add=TRUE)
+plot(bag.roc,xlim=c(0,1),ylim=c(0,1), lty=5, add=TRUE)
+
+legend(0.4, 0.5, 0.6, legend=c(paste("Logit Regr (AUC: ", glm.auc, ")", sep=""),
+                               paste("Simple Tree (AUC: ", simple.auc, ")",sep=""), 
+                               paste("Boosting (AUC: ", boost.auc, ")", sep=""),
+                               paste("Random Forest (AUC: ", rf.auc, ")", sep=""),
+                               paste("Bagging (AUC: ", bag.auc, ")", sep="")),
+                               lty=c(1:5), border = FALSE)
+
+
+
+```
+
+## execute the k means clustering for the existing data
+```{r}
+
+means.data.df = meansx.data.df
+
+#make all the variables numeric
+means.data.df$deadline_year = as.numeric(means.data.df$deadline_year)
+means.data.df$deadline_month = as.numeric(means.data.df$deadline_month)
+
+#standardizing the data
+means.data.df.sc <- scale(means.data.df)
+
+#view summary of standardized data
+summary(means.data.df.sc)
+
+#set seed for kmeans clustering
+set.seed(1234567)
+
+#deciding the optimal number of clusters
+SSE_curve <- c()
+for (n in 1:10) {
+  kcluster <- kmeans(means.data.df.sc, n)
+  sse <- sum(kcluster$withinss)
+  SSE_curve[n] <- sse
+}
+print("SSE curve for the ideal k value")
+plot(1:10, SSE_curve, type="b", xlab="Number of Clusters", ylab="SSE")
+
+# doing k-means clustering
+kcluster <- kmeans(means.data.df.sc,6)
+kcluster$size
+clus <- kcluster$cluster
+means.data2.df<-cbind(means.data2.df,clus)
+
+summary(means.data2.df)
+
+# comparing clusters, shows the mean values in groups:
+aggregate(means.data.df, list(means.data2.df$clus), function(x) mean(as.numeric(x)))
+
+# now create plots to understand the categorisation
+
+#result in cluster
+tbl4 <- aggregate( result~ clus, data=means.data2.df, mean)  
+barplot(tbl4$result, beside = TRUE, legend = TRUE, main='Result in Clusters', xlab='Cluster', ylab = 'Result in Cluster')
+
+#backers in cluster
+tbl4 <- aggregate( backers~ clus, data=means.data2.df, mean)  
+barplot(tbl4$backers, beside = TRUE, legend = TRUE, main='backers in Clusters', xlab='Cluster', ylab = 'backers in Cluster')
+
+#usd_pledged_real in cluster
+tbl4 <- aggregate( usd_pledged_real~ clus, data=means.data2.df, mean)  
+barplot(tbl4$usd_pledged_real, beside = TRUE, legend = TRUE, main='usd_pledged_real in Clusters', xlab='Cluster', ylab = 'usd_pledged_real in Cluster')
+
+#usd_goal_real in cluster
+tbl4 <- aggregate( usd_goal_real~ clus, data=means.data2.df, mean)  
+barplot(tbl4$usd_goal_real, beside = TRUE, legend = TRUE, main='usd_goal_real in Clusters', xlab='Cluster', ylab = 'usd_goal_real in Cluster')
+
+#comp_ratio in cluster
+tbl4 <- aggregate( comp_ratio~ clus, data=means.data2.df, mean)  
+barplot(tbl4$comp_ratio, beside = TRUE, legend = TRUE, main='comp_ratio in Clusters', xlab='Cluster', ylab = 'comp_ratio in Cluster')
+
+#time2success in cluster
+tbl4 <- aggregate( time2success~ clus, data=means.data2.df, mean)  
+barplot(tbl4$time2success, beside = TRUE, legend = TRUE, main='time2success in Clusters', xlab='Cluster', ylab = 'time2success in Cluster')
+
+
+
+#means4.data2.df = subset(means.data2.df,means.data2.df$clus==4)
+#x.df <- data.df %>%inner_join(means4.data2.df, by = "ID")
+
+#meansn.data2.df = subset(means.data2.df,means.data2.df$clus!=4)
+#y.df <- data.df %>%inner_join(meansn.data2.df, by = "ID")
+
+means1.data2.df = subset(means.data2.df,means.data2.df$clus==1)
+one.df <- data.df %>%inner_join(means1.data2.df, by = "ID")
+
+means2.data2.df = subset(means.data2.df,means.data2.df$clus==2)
+two.df <- data.df %>%inner_join(means2.data2.df, by = "ID")
+
+means3.data2.df = subset(means.data2.df,means.data2.df$clus==3)
+three.df <- data.df %>%inner_join(means3.data2.df, by = "ID")
+
+means4.data2.df = subset(means.data2.df,means.data2.df$clus==4)
+four.df <- data.df %>%inner_join(means4.data2.df, by = "ID")
+
+means5.data2.df = subset(means.data2.df,means.data2.df$clus==5)
+five.df <- data.df %>%inner_join(means5.data2.df, by = "ID")
+
+means6.data2.df = subset(means.data2.df,means.data2.df$clus==6)
+six.df <- data.df %>%inner_join(means6.data2.df, by = "ID")
+
+summary(one.df)
+summary(two.df)
+summary(three.df)
+summary(four.df)
+summary(five.df)
+summary(six.df)
+
+
+```
+
+
+## execute a truncate web version of the data and run 
+```{r}
+
+# read the truncated version of data with additional field
+datat.df = read.csv("dataset/ks-projects-201801_trunc.csv") 
+datat2.df = read.csv("dataset/ks-projects-201801_trunc_2.csv") 
+nyset.df = read.csv("dataset/NYSE_prices.csv")
+
+
+tempt.df = datat.df 
+tempt2.df = datat2.df
+
+tempt2.df$deadline = ymd(as.character(tempt2.df$deadline))
+tempt2.df$deadline = strftime(tempt2.df$deadline , "%d/%m/%Y")
+
+
+# now merge the two data frames 
+tempt.df = rbind(tempt.df,tempt2.df)
+
+# str(kickt.df)
+#nrow(tempt.df)
+
+#tempt.df$launched_dt = strftime(strptime(tempt.df$launched,"%d/%m/%Y %H:%M"),"%m/%d/%Y")
+
+# drop the columns which we don't need
+#nyset.df = nyset.df[ , which(names(nyset.df) %in% c("Date","Adj.Close"))]
+
+#change the column name for the nyse data
+#colnames(nyset.df) = c("launched_dt","NYSE_price")
+
+#nyset.df$launched_dt = as.character(nyset.df$launched_dt)
+
+#View(tempt.df$launched_dt)
+#View(nyset.df$launched_dt)
+
+#tempt.df <- tempt.df %>%inner_join(nyset.df, by = "launched_dt")
+
+# copy the data into a temp variable
+kickt.df = tempt.df
+
+# str(kickt.df)
+nrow(kickt.df)
+
+# create additional columns
+kickt.df$name_length = nchar(as.character(kickt.df$name), type = "chars", allowNA = FALSE, keepNA = NA)
+kickt.df$comp_ratio = kickt.df$usd_pledged_real/ kickt.df$usd_goal_real
+kickt.df$desc_length = nchar(as.character(kickt.df$desc), type = "chars", allowNA = FALSE, keepNA = NA)
+
+#Converting date time-stamps to date and time format
+
+kickt.df$deadline <- strptime(kickt.df$deadline, "%d/%m/%Y")
+kickt.df$time2success <- as.numeric(difftime(kickt.df$deadline, kickt.df$launched, units="days"))
+
+# create additional variables for year and month
+kickt.df$launched_month = factor(month(kickt.df$launched))
+
+kickt.df$deadline_year = factor(year(kickt.df$deadline))
+kickt.df$deadline_month = factor(month(kickt.df$deadline))
+
+# str(kickt.df)
+nrow(kickt.df)
+
+#Filtering out records where the name is not present
+kickt.df = subset(kickt.df,kickt.df$name_length>0)
+nrow(kickt.df)
+
+#Filtering out records where the goal is less than 50 dollars
+kickt.df = subset(kickt.df,kickt.df$usd_goal_real>500)
+nrow(kickt.df)
+
+#Filtering out records where the amound pledged is 25 - at least 5% of the minimum value
+kickt.df = subset(kickt.df,kickt.df$usd_pledged_real>25)
+nrow(kickt.df)
+
+#Filtering out records where the status for the kicktstarter is undefined value
+kickt.df = subset(kickt.df,kickt.df$state!="undefined")
+nrow(kickt.df)
+
+# impute the data where the status was cancelled to failed
+# it is a big big assumption , and we can look at data latter to understand more 
+# about the cancelled kickt starters later
+kickt.df$state[kickt.df$state=="canceled"] = "failed"
+kickt.df$state[kickt.df$state=="suspended"] = "failed"
+
+# also assuming that the status will be changed to sucess if the current status is live
+kickt.df$state[kickt.df$state=="live"] = "successful"
+
+# make the factor variable setting of state to only 2 
+kickt.df$state = as.factor(as.character(kickt.df$state))
+
+#filter the outliers where the comp ratio is more than 20 times the initial projection
+kickt.df = subset(kickt.df,kickt.df$comp_ratio<20)
+
+# take a copy of the data to be used for sentiment analysis
+sent.data.df = kickt.df
+
+# now trim the unwanted variables , we are getting rid of category also
+# as there is too much of diversification due to category
+kickt.df = kickt.df[ , -which(names(kickt.df) %in% c("X","ID","name","category","deadline","launched","pledged","country","usd.pledged","desc","author_name"))]
+
+View(kickt.df)
+
+#set a specfic see
+set.seed(12345678)
+
+#get training and testing data we are dividing the data into 60:40 ratio
+ind = sample(1:nrow(kickt.df),floor(nrow(kickt.df)*0.40))
+kickt.train.df = kickt.df[ind,]
+kickt.test.df =kickt.df[-ind,]
+
+# now trim the unwanted variables , we are getting rid of category also
+# as there is too much of diversification due to category we are letting ID and desc variable go in the model
+sent.data.df = sent.data.df[ , -which(names(sent.data.df) %in% c("X","name","category","deadline","launched","pledged","country","usd.pledged","author_name"))]
+
+
+```
+
+# first attempt a multi linear regression with comp_ratio as a depedent continuous variable
+```{r}
+
+# create a variable which stores the data for regression
+reg.data = kickt.train.df
+
+str(reg.data)
+
+# get a subset of reg data of continious variables
+reg.cont.data = reg.data[ , which(names(reg.data) %in% c("backers","usd_pledged_real","usd_goal_real","name_length","comp_ratio","time2success","NYSE_price","other_projects","pledge_denom","desc_length"))]
+
+#plot a coorelation graph
+str(reg.data)
+regcor = cor(reg.cont.data)
+print(regcor)
+corrplot(regcor,method = "number")
+
+#plot matrix of all variables
+#plot(reg.cont.data,pch=16,col="light blue")
+
+# as there is too much of diversification due to category
+reg.data = reg.data[ , -which(names(reg.data) %in% c("state"))]
+
+
+# step wise regression
+base.mod = lm(comp_ratio ~ 1,data=reg.data)
+all.mod = lm(comp_ratio ~ . ,data = reg.data)
+stepMod = step(base.mod,scope = list(lower=base.mod,upper=all.mod),direction = "both",trace=0,steps = 1000) #perform step-wise algorithm
+summary(stepMod)
+
+
+# run the prediction
+prediction = predict(stepMod,kickt.test.df)
+
+# find correlational accuracy
+actuals_preds <- data.frame(cbind(actuals=kickt.test.df$comp_ratio, predicteds=prediction))  # make actuals_predicteds dataframe.
+correlation_accuracy <- cor(actuals_preds)  # 24.88%
+print(correlation_accuracy)
+```
+
+## text analytics to do sentiment analysis and then do a multi regression
+## with sentiment as one of the varibles.
+```{r}
+# create a variable which stores the data for sentiment
+sent.data = sent.data.df
+
+sent.data$desc =as.character(sent.data$desc)
+str(sent.data$desc)
+
+#We do some data manipulation work like removing stopwords, punctuation marks, etc.
+review_words <- sent.data %>%
+  select(ID, comp_ratio, desc) %>%
+  unnest_tokens(word, desc) %>%
+  filter(!word %in% stop_words$word,
+         str_detect(word, "^[a-z']+$"))
+
+#View reviews_words; to see one word per document and how the data array looks like
+View(review_words)
+
+#apply AFINN
+AFINN <- sentiments %>%
+  filter(lexicon == "AFINN") %>%
+  select(word, afinn_score = score)
+
+#see the AFINN scores being assigned to see if they make sense
+View(AFINN)
+
+#The commands below now combine the scores and assigns it to each reviewer so that
+#we can analyze by reviewer (we also have the star/5-point scale side by side)
+reviews_sentiment <- review_words %>%
+  inner_join(AFINN, by = "word") %>%
+  group_by(ID, comp_ratio) %>%
+  summarize(sentiment = mean(afinn_score))
+
+#Let's view to make sure each line has reviewer-sent.score-star rat. all lined up
+View(reviews_sentiment)
+
+sent.data2 = sent.data%>%
+  inner_join(reviews_sentiment[,-2], by = "ID")
+
+correlation_accuracy <- cor(reviews_sentiment$comp_ratio,reviews_sentiment$sentiment)
+print(correlation_accuracy)
+
+#set a specfic see
+set.seed(12345678)
+
+#get training and testing data we are dividing the data into 60:40 ratio
+ind = sample(1:nrow(sent.data2),floor(nrow(sent.data2)*0.40))
+sent.train.df = sent.data2[ind,]
+sent.test.df =sent.data2[-ind,]
+
+# going forward use sent.train.df and sent.test.df
+
+# now use it to do multi step regression 
+# step wise regression
+base.mod = lm(comp_ratio ~ main_category,data=sent.train.df[,c(-1,-9)])
+all.mod = lm(comp_ratio ~ . ,data = sent.train.df[,c(-1,-9)])
+stepMod = step(base.mod,scope = list(lower=base.mod,upper=all.mod),direction = "both",trace=0,steps = 1000) #perform step-wise algorithm
+summary(stepMod)
+
+# run the prediction
+prediction = predict(stepMod,sent.test.df[,c(-1,-9)])
+
+# find correlational accuracy
+actuals_preds <- data.frame(cbind(actuals=sent.test.df$comp_ratio, predicteds=prediction))  # make actuals_predicteds dataframe.
+correlation_accuracy <- cor(actuals_preds)
+print(correlation_accuracy) #18.187%
+
+#Now we perform various simple analysis to check the validity of this sentiment coding
+#Let's begin with some plots for eyeballing the results
+
+#This is a scatterplot/boxplot of sentiment scores vs. 5 star rating 
+library(ggplot2)
+theme_set(theme_bw())
+ggplot(reviews_sentiment, aes(comp_ratio, sentiment, group = comp_ratio)) +
+  geom_boxplot() +
+  ylab("Average sentiment score")
+
+#The following lines of code (75-94) have been written to first see if there are any
+#weird words (or non-words) still leftover, so that we can then weed them out
+#First let's group words that cooccur with positive and negative 5-star reviews
+review_words_counted <- review_words %>%
+  count(ID, comp_ratio, word) %>%
+  ungroup()
+
+#As always let's view it
+View(review_words_counted)
+
+#Look at the word frequencies
+word_summaries <- review_words_counted %>%
+  group_by(word) %>%
+  summarize(businesses = n_distinct(ID),
+            reviews = n(),
+            uses = sum(n),
+            average_stars = mean(comp_ratio)) %>%
+  ungroup()
+
+#As always let's view it (there are weird words in there!)
+View(word_summaries)
+
+#choose words for analysis that appear in at least 200 reviews and for at least 10 businesses
+word_summaries_filtered <- word_summaries %>%
+  filter(reviews >= 20, businesses >= 1)
+
+#As always let's view it (no more weird words in there)
+View(word_summaries_filtered)
+
+#check the frequent positive words (to see if it makes sense)
+word_summaries_filtered %>%
+  arrange(desc(average_stars))
+
+#check the frequent negative words (to see if it makes sense)
+word_summaries_filtered %>%
+  arrange(average_stars)
+
+#the rest of the commands below try to understand the specific words that people use
+
+#looking at relationship between lexicon and ratings
+words_afinn <- word_summaries_filtered %>%
+  inner_join(AFINN)
+
+View(words_afinn)
+
+#plot of ratings versus scores in lexicon
+ggplot(words_afinn, aes(afinn_score, average_stars, size = reviews)) + 
+  geom_smooth(method="lm", se=FALSE, show.legend=FALSE) +
+  geom_text(aes(label = word, size = NULL), check_overlap = TRUE, vjust=1, hjust=1) +
+  geom_point() +
+  scale_x_continuous(limits = c(-6,6)) +
+  xlab("AFINN sentiment score") +
+  ylab("Average Yelp stars")
+
+#plot of ratings versus lexicon scores with colour coding - this graphs shows why the stuff is not working
+ggplot(words_afinn, aes(reviews, average_stars, color = afinn_score)) +
+  geom_point() +
+  geom_text(aes(label = word), check_overlap = TRUE, vjust = 1, hjust = 1) +
+  scale_x_log10() +
+  geom_hline(yintercept = mean(sent.data$comp_ratio), color = "red", lty = 2) +
+  scale_colour_gradient2("AFINN", low = "red", mid = "white", high = "blue", limits = c(-5,5)) +
+  xlab("# of words in description") +
+  ylab("Average Comp ratio")
+
+#box plot of ratings vs. lexicon scores
+ggplot(words_afinn, aes(afinn_score, average_stars, group = afinn_score)) +
+  geom_boxplot() +
+  xlab("AFINN score of word") +
+  ylab("Average comp ratio of projects with this word")
+
+```
+
+
+
+```{r KickScraper}
+data.df = read.csv("UpdatedKickstarterData2.csv")
+# copy data in another data frame which will be used 
+kick.df = data.df
+i=1560
+for(i in 6:nrow(kick.df)){
+  baseurl="https://www.kickstarter.com/projects"
+  id=kick.df[i,"ID"]
+  name=kick.df[i,"name"]
+  url<-paste(id,name,sep = "/")
+  url<-gsub("[.]","",url)
+  url<-gsub("Canceled","",url)
+  url<-gsub(" [(]","-",url)
+  url<-gsub("[(]","",url)
+  url<-gsub("[)]","",url)
+  url<-gsub(" [|]","",url)
+  url<-paste(baseurl,url,sep="/")
+
+url<-gsub(" ","-",url)
+url<-gsub("&","and",url)
+url<-gsub("?","",url)
+url<-gsub(":","",url)
+url<-gsub("!","",url)
+url<-gsub("'","",url)
+url<-gsub(",","",url)
+url<-gsub("™","tm",url)
+url<-gsub("\"","",url)
+url<-gsub("[*]","-",url)
+url<-gsub("---","-",url)
+
+url<-gsub("--","-",url)
+
+
+
+url<-gsub("https","https:",url)
+
+print(url)
+url<-substr(url,0,98)
+if(str_sub(url, start= -1)=="-")
+  url<-gsub('.{1}$', '', url)
+data=NA;
+tryCatch({
+ data <- url %>%
+    read_html() 
+ return(data)
+},error=function(e){
+  data=NA
+  return(0)
+})
+if(is.na(data))
+{
+  next
+}
+
+
+project_desc<-data %>%
+    html_nodes("div.col-20-24 p.type-14") %>%
+    html_text()
+if(length(project_desc)==0){
+  project_desc<-data %>%
+    html_nodes("span.content") %>%
+    html_text()
+}
+author_name<-data %>%
+    html_nodes("span.navy-700 a.medium") %>%
+    html_text()
+if(length(author_name)==0){
+  author_name<-data %>%
+    html_nodes("div.mobile-hide a.hero__link") %>%
+    html_text()
+}
+other_projects<-data %>%
+    html_nodes("span.hide a.remote_modal_dialog") %>%
+    html_text()
+
+img_count = data %>% html_nodes("col-8 description-container")%>% html_children() %>%
+        html_attr("img")
+  
+  
+if(length(other_projects)!=0){
+if(is.na(other_projects)){
+ other_projects<-data %>%
+    html_nodes("div.navy-500") %>%
+    html_text() 
+}}
+else{
+  other_projects=0
+}
+
+pledge_denom<-data %>%
+    html_nodes("li.hover-group")
+project_desc<-gsub("\n","",project_desc)
+author_name<-gsub("\n","",author_name)
+other_projects<-gsub("\n","",other_projects)
+other_projects<-gsub(" created","",other_projects)
+if(other_projects=="First"){
+  other_projects=0
+}
+kick.df[i,"desc"]<-project_desc
+kick.df[i,"author_name"]<-author_name
+kick.df[i,"other_projects"]<-other_projects
+kick.df[i,"pledge_denom"]<-length(pledge_denom)
+print(paste("Project ", i, " done", sep =""))
+}
+write.csv(kick.df,file="UpdatedKickstarterData.csv")
+
+
+
+
+
+
+
+
+
